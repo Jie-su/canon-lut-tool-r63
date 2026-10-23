@@ -1,0 +1,40 @@
+{
+  "checkedOn": "2026-10-23",
+  "licenseFiles": [
+    {
+      "file": "Python-3.13.3-LICENSE.txt",
+      "upstream": "https://github.com/python/cpython/blob/v3.13.3/LICENSE",
+      "sha256": "78b12c3a81360b357002334f0e70ea0e92eebf7a9b358805c03c48484945f3bb",
+      "bytes": 13809,
+      "method": "Unmodified license text from the Python.org 3.13.3 installation"
+    },
+    {
+      "file": "Python-3.13.3-History-and-License.rst",
+      "upstream": "https://github.com/python/cpython/blob/v3.13.3/Doc/license.rst",
+      "sha256": "62f2c9c2c75d511170eb464ad5f83b78cc1f37eb2eb49c2846c9aa6c4557ee99",
+      "bytes": 55737,
+      "method": "Unmodified complete license document from the Python.org 3.13.3 installation"
+    },
+    {
+      "file": "OpenSSL-3.0.16-LICENSE.txt",
+      "upstream": "https://raw.githubusercontent.com/openssl/openssl/openssl-3.0.16/LICENSE.txt",
+      "sha256": "7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a",
+      "bytes": 10175,
+      "method": "Unmodified upstream license text"
+    },
+    {
+      "file": "ncurses-6.5-COPYING.txt",
+      "upstream": "https://raw.githubusercontent.com/ThomasDickey/ncurses-snapshots/v6_5/COPYING",
+      "sha256": "b2feb54f39529abe226f709a292584fde48a2e5721559fee417d2cdd51cb7cc1",
+      "bytes": 1447,
+      "method": "Unmodified upstream license text"
+    },
+    {
+      "file": "XZ-5.2.3-COPYING.txt",
+      "upstream": "https://raw.githubusercontent.com/tukaani-project/xz/v5.2.3/COPYING",
+      "sha256": "c4f8e14fafe458d84808a4cd8b69f94673ebe2bf8fc992291629a69ac12218f8",
+      "bytes": 2774,
+      "method": "Unmodified upstream license text"
+    }
+  ]
+}

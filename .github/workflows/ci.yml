@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Pure Python and public-tree audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Run tests without Canon software or devices
+        env:
+          PYTHONPATH: src
+        run: python3 -m unittest discover -s src/r6lut -t src -p 'test_*.py'
+      - name: Audit public source tree
+        run: python3 scripts/audit_public_tree.py
+
+  swift:
+    name: macOS Swift typecheck
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Typecheck without launching app or Canon libraries
+        run: |
+          swiftc -typecheck -parse-as-library -swift-version 5 \
+            -target arm64-apple-macosx13.0 \
+            -framework SwiftUI -framework AppKit -framework CryptoKit \
+            -framework IOKit -framework CoreImage -framework ImageIO \
+            app/CanonLUTTool.swift app/CameraConnectionMonitor.swift app/PhotoPreview.swift

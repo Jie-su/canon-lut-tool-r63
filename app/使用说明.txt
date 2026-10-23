@@ -1,0 +1,40 @@
+Canon LUT 工具 R63 1.3.0 beta.1（公开版）
+https://github.com/Jie-su/canon-lut-tool-r63
+
+公开版不携带任何使用者的相机快照、基础 PF3、照片、第三方 LUT 或 Canon 软件。
+支持 Apple Silicon Mac；应用目标 macOS 13 及以上，RAW 支持取决于本机系统解码器。
+
+照片对比：
+在“照片对比”左侧导入照片，选择自己的 CUBE 或 PF3，使用并排或滑动对比。
+CUBE 预览无需连接相机或建立转换配置。普通照片直接应用 LUT，RAW 先由 macOS 显影。
+C-Log LUT 可选择 C-Log 2/3 照片近似适配，并按原 LUT 说明设置色域和输出编码。
+PF3 不叠加 C-Log：原生 PSE 参数型 PF3 用 Canon RAW 离线显影，需本机官方 PSE；
+本工具生成的 PF3 从内嵌表做照片近似预览，需配套清单，或与本机配置匹配。
+原生 PSE PF3 不直接应用到 JPEG，需对应 Canon RAW／CR3。预览可导出 PNG。
+
+第一次转换：
+1. 从佳能官网下载并安装自己的 EOS Utility 3 与 Picture Style Editor。
+2. 用自己的 RAW，在 PSE 导出可编辑的 Standard／标准基础 PF3。
+3. 用官方 EOS Utility 将同一文件注册到用户定义 1；其他目标用户槽也需官方初始化。
+4. 退出 EOS Utility，连接并唤醒相机。在“转换与写入”点击“建立本机配置”。
+5. 选择自己的基底，然后只读获取相机快照，或导入本工具已有的完整快照文件夹。
+配置仅保存在你的 Application Support；配置不会写入相机，也不会上传。
+程序保留 R6 Mark III 1.1.2、固定 SDK／解析器、描述符和 type10 的已验证守卫。
+
+转换与写入：
+配置成功后导入 CUBE 或文件夹。每个输出包含 PF3、full33.bin、manifest.json，须保存在一起。
+选定文件的用户槽 1／2／3，核对确认窗口后才能写入。工具先备份再写，并强制从设备重新读取。
+写入期间保持 USB 连接并退出其他相机软件。未选槽及当前活动状态会被核对。
+本工具的 CUBE dense PF3 必须用配套 full33 路线写入；普通 EOS Utility 会重建色表。
+官方 PSE 制作的参数型 PF3 可以通过普通官方注册流程导入。
+读取备份不等于可直接发送的恢复载荷，请保留自己的原始 PF3。
+
+兼容性：
+已有设备证据来自一台 R6 Mark III 1.1.2 的恒等、红蓝交换、JPEG及一次重启试验；
+公开版首次配置与包装改造进行了离线验证，未额外进行硬件写入验证。
+不能把结构读回成功当成任意 LUT、模式、固件都已精确兼容。
+此发行包为本地 ad-hoc 签名，未使用 Developer ID 公证。请按 Apple 官方系统提示处理，
+项目不要求关闭系统安全保护。
+
+更多操作、源码构建与贡献指南见仓库 README 和 docs/。
+MIT 许可只覆盖本项目代码；随包运行时及其他软件的许可见 LICENSE、THIRD_PARTY_NOTICES.md 和 licenses/。
