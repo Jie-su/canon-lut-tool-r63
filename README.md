@@ -4,7 +4,7 @@
 
 面向 macOS Apple Silicon 的 CUBE → PF3 工具与照片对比工作台，包含 Canon EOS R6 Mark III 的实验性 USB 照片风格注册流程。
 
-[下载测试版](https://github.com/Jie-su/canon-lut-tool-r63/releases) · [首次使用](docs/SETUP.md) · [开发说明](docs/DEVELOPMENT.md) · [R7 → R6 III 技术记录](docs/R7_TO_R6III.md)
+[下载 v1.3.7-beta.1](https://github.com/Jie-su/canon-lut-tool-r63/releases/tag/v1.3.7-beta.1) · [更新记录](CHANGELOG.md) · [首次使用](docs/SETUP.md) · [开发说明](docs/DEVELOPMENT.md) · [R7 → R6 III 技术记录](docs/R7_TO_R6III.md)
 
 ![照片对比工作台](docs/images/workspace.png)
 
@@ -22,12 +22,27 @@
 - 自动识别佳能 USB 设备，提供连接诊断；写入时暂停后台探测。
 - 为指定的 R6 III 用户槽 1–3 备份、写入并重新请求设备数据验证。
 
-当前源码更新为 **v1.3.7-beta.1（开发中）**，加入照片同位置联动缩放与 100%／150%／200% 倍率选择，切换 PF3 后保留查看位置。继续支持八个 CUBE 或 PF3 加原图的多图比较，并保留完整画面、填充点击和缓存修正；导入新照片自动恢复完整显示和居中视图。尚未发布对应版本的 App；[Releases](https://github.com/Jie-su/canon-lut-tool-r63/releases) 当前已发布的版本为 **v1.3.0-beta.1**。此前的私有实现曾在一台 R6 III／固件 1.1.2 上通过恒等 LUT、红蓝交换、机内 JPEG 和一次关机重启验证，并完成过三槽写入。公开版增加了使用者自己的本地配置初始化，不能把这些历史结果视为所有用户、固件或 LUT 的兼容保证。
+## v1.3.7-beta.1 更新了什么
+
+本次公开 Beta 汇总上个公开版 **v1.3.0-beta.1** 之后的照片对比更新；1.3.1–1.3.6 为内部迭代，没有单独公开发行。
+
+| 更新 | 使用时的变化 |
+| --- | --- |
+| CUBE／PF3 文件夹 | 导入一次即可递归浏览子目录、搜索名称、查看格式标记并点击预览。CUBE 文件夹默认按 sRGB 直接套用，Log LUT 可关闭此选项后选择适配。 |
+| 最多九图比较 | 固定保留原图，最多勾选 8 个 CUBE 或 8 个 PF3。按实际图数重新分区，移除后不留空格；切到滑动对比查看当前激活项，返回后保留选择。 |
+| 同位置联动缩放 | 单击照片定位放大，再次单击缩回；可选适合窗口、100%、150%、200%。切换 PF3、增删预设或切换比较方式保留倍率与位置，导入新照片恢复居中完整视图。 |
+| 完整／填充显示修复 | 修复填充后图片挡住工具栏、无法点回完整显示的问题；修正原生 PF3 竖拍 RAW 预览的源区域计算，保留完整构图。 |
+| PF3 预览与缓存 | 支持多个 PF3 逐项生成、单项报错和结果复用；显影参照不同的预设提示单独查看，避免共用错误的原图基准。 |
+| 完整结果导出 | 点击标题选择导出项；缩放、定位和填充裁切只影响查看，PNG 仍导出完整预览结果。 |
+
+100% 按当前预览图像素与屏幕物理像素计算；当前预览长边最多 1600 像素，并非原始 RAW 的全分辨率检查。照片视口、模型与布局回归检查已加入 CI；详见[版本记录](CHANGELOG.md)与[发行说明](docs/RELEASE_NOTES.md)。
+
+本次没有扩展相机兼容范围或改动写入流程。此前的私有实现曾在一台 R6 III／固件 1.1.2 上通过恒等 LUT、红蓝交换、机内 JPEG 和一次关机重启验证，并完成过三槽写入。公开版使用本机配置初始化，不能把这些历史结果视为所有用户、固件或 LUT 的兼容保证。
 
 ## 下载与开始使用
 
-1. 从 [Releases](https://github.com/Jie-su/canon-lut-tool-r63/releases) 下载 macOS arm64 ZIP 和校验文件，解压 App。
-2. 打开“照片对比”，导入照片与自己的 CUBE 或 PF3，即可开始预览；这一步不需要连接相机。新版源码支持导入 CUBE／PF3 文件夹；勾选最多 8 个同类预设与原图同时比较，增删选择后自动重新分区。点击标题激活导出项；点击照片可联动缩放并激活该项。滑动对比沿用当前激活项。切换 CUBE／PF3 类型会开始新的比较组。每次导入新照片自动恢复完整显示且共同缩放；填充显示仅裁切屏幕上的预览，导出的 PNG 仍保留完整画面。
+1. 从 [v1.3.7-beta.1 Release](https://github.com/Jie-su/canon-lut-tool-r63/releases/tag/v1.3.7-beta.1) 下载 `Canon-LUT-Tool-R63-v1.3.7-beta.1-macOS-arm64.zip` 和 `SHA256SUMS.txt`，核对校验值后解压 App。继续开发可下载同页的 `Canon-LUT-Tool-R63-v1.3.7-beta.1-developer.zip`，内含公开源码、来源提交与文件校验清单。
+2. 打开“照片对比”，导入照片与自己的 CUBE 或 PF3，即可开始预览；这一步不需要连接相机。可导入 CUBE／PF3 文件夹，勾选最多 8 个同类预设与原图同时比较，增删选择后自动重新分区。点击标题激活导出项；点击照片可联动缩放并激活该项。滑动对比沿用当前激活项。切换 CUBE／PF3 类型会开始新的比较组。每次导入新照片自动恢复完整显示且共同缩放；填充显示仅裁切屏幕上的预览，导出的 PNG 仍保留完整画面。
 3. 单击照片中的部位可让所有预览同步放大到该位置，再次单击缩回完整画面；也可选择 100%、150%、200%。倍率针对当前预览图，100% 对应一个图像像素显示为一个屏幕物理像素；预览可能已缩小原片。切换 PF3 保留倍率与位置；“适合窗口”恢复完整画面，“重置视图”还会将定位点居中。
 4. 如需转换或写入，先按[初始化指南](docs/SETUP.md)准备自己的 Standard PF3 基底与只读相机快照，建立本机配置。
 
@@ -92,4 +107,4 @@ python3 scripts/audit_public_tree.py
 
 ## English
 
-An open-source macOS Apple Silicon tool for CUBE-to-PF3/full33 conversion, before/after photo comparison, and experimental Canon EOS R6 Mark III Picture Style installation. Photo preview works without a camera. Folders can contain CUBE and PF3 files; up to eight CUBE or eight PF3 looks share a comparison canvas with the original. Switching file types starts a new comparison group. Native and embedded-grid PF3 looks use different rendering references, so a mismatched PF3 item is reported individually and should be viewed on its own. Complete display keeps a common image scale; fill display crops the on-screen view only. Conversion uses your own locally initialized PF3/camera context; Canon software and personal device data are not redistributed. Native PSE PF3 preview requires supported Canon RAW, while embedded-grid PF3 preview is a photographic approximation. Camera support is limited to the pinned R6 III 1.1.2 environment. The downloadable beta is ad-hoc signed and is not Apple-notarized.
+An open-source macOS Apple Silicon tool for CUBE-to-PF3/full33 conversion, before/after photo comparison, and experimental Canon EOS R6 Mark III Picture Style installation. Photo preview works without a camera. Version 1.3.7-beta.1 adds recursive CUBE/PF3 folder browsing, up to eight same-type looks plus the original, linked point zoom at 100%/150%/200%, and fixes for fill-mode input blocking and cropped native RAW previews. Zoom persists when switching PF3 files; percentages refer to the current preview pixels, not full-resolution RAW data. App and developer ZIPs are available in the release. Native and embedded-grid PF3 looks use different rendering references, so a mismatched item is reported individually and should be viewed on its own. Complete display keeps a common image scale; fill and zoom affect viewing only, while PNG export retains the complete rendered result. Conversion uses your own locally initialized PF3/camera context. Native PSE PF3 preview requires local Canon software and supported Canon RAW; embedded-grid PF3 preview is a photographic approximation. Camera support remains limited to the pinned R6 III 1.1.2 environment. No Canon libraries or private camera/photo/LUT data are redistributed. The beta is ad-hoc signed and is not Apple-notarized.
