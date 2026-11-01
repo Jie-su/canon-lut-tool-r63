@@ -45,4 +45,10 @@ jobs:
             -target arm64-apple-macosx13.0 \
             -framework SwiftUI -framework AppKit -framework CryptoKit \
             -framework IOKit -framework CoreImage -framework ImageIO \
-            app/CanonLUTTool.swift app/CameraConnectionMonitor.swift app/PhotoPreview.swift
+            app/CanonLUTTool.swift app/CameraConnectionMonitor.swift app/PhotoPreview.swift app/PhotoPreviewPanel.swift app/PreviewPhotoView.swift app/ComparisonLayout.swift
+      - name: Test CUBE/PF3 folder scanning and comparison selection without camera or Canon software
+        run: python3 -B scripts/test_photo_preview.py
+      - name: Test adaptive photo layouts without app or Canon software
+        run: python3 -B scripts/test_comparison_layout.py
+      - name: Test photo viewport drawing and input boundaries without photos or Canon software
+        run: python3 -B scripts/test_preview_photo_view.py

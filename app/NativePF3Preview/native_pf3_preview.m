@@ -12,12 +12,16 @@ typedef uint32_t U;
 typedef void *Ref;
 typedef struct { int32_t x,y,width,height; } DppRect;
 typedef struct { int32_t width,height; } DppSize;
+// The installed arm64 DppGetImageInfo writes four 32-bit fields; only the
+// first two are needed for the developed image's actual source dimensions.
+typedef struct { uint32_t width,height,reserved[2]; } DppImageInfo;
 static U (*Init)(void),(*Term)(void),(*Release)(Ref);
 static U (*CreateFile)(CFURLRef,U,U,Ref*),(*CreateServer)(Ref,Ref*),(*Revert)(Ref);
 static U (*Set)(Ref,U,U,U,const void*),(*SetStyle)(Ref,CFURLRef),(*SetProfile)(Ref,Ref);
 static U (*GetSize)(Ref,U,U,U*,U*),(*Get)(Ref,U,U,U,void*);
 static U (*ProcessEx)(Ref,U,U,U,DppRect,DppSize,Ref,Ref*);
 static U (*ProcessWith)(Ref,Ref,U,U,DppRect,DppSize,Ref,Ref*);
+static U (*ImageInfo)(Ref,DppImageInfo*);
 static U (*Memory)(void*,U,Ref*),(*Output)(Ref,U,U,Ref);
 
 static void emit(NSDictionary *value) {
@@ -45,11 +49,25 @@ static BOOL verifyD(Ref recipe,U prop,double expected,NSString *name) {
     emit(@{@"event":@"verified_recipe",@"name":name,@"expected":@(expected),@"actual":isfinite(actual)?@(actual):[NSNull null],@"rc":@(rc)});
     return rc==0&&actual==expected;
 }
-static NSData *render(Ref recipe,int w,int h) {
-    DppRect rect={0,0,w,h};DppSize size={w,h};Ref base=NULL,result=NULL,stream=NULL;
+static NSData *render(Ref recipe,int w,int h,BOOL swapsAxes) {
+    // Development uses sensor geometry; the output stage applies orientation.
+    int developW=swapsAxes?h:w,developH=swapsAxes?w:h;
+    DppRect developRect={0,0,developW,developH};DppSize developSize={developW,developH};
+    DppSize outputSize={w,h};Ref base=NULL,result=NULL,stream=NULL;
     unsigned char aux[256]={0};NSMutableData *data=[NSMutableData dataWithLength:(NSUInteger)w*h*3];
-    BOOL ok=check(ProcessEx(recipe,1,1,1,rect,size,aux,&base),@"process_base")&&base;
-    if(ok)ok=check(ProcessWith(recipe,base,0,0,rect,size,aux,&result),@"process_output")&&result;
+    BOOL ok=check(ProcessEx(recipe,1,1,1,developRect,developSize,aux,&base),@"process_base")&&base;
+    if(ok) {
+        DppImageInfo info={0};
+        ok=check(ImageInfo(base,&info),@"base_image_info")&&info.width>0&&info.height>0&&info.width<=100000&&info.height<=100000;
+        // DPP may develop to a size different from the requested preview.
+        // ProcessWith's rectangle is a SOURCE region, not the output size.
+        // Reusing w/h here cropped a 1336x2004 portrait source to 1067x1600.
+        DppRect full={0,0,swapsAxes?(int)info.height:(int)info.width,swapsAxes?(int)info.width:(int)info.height};
+        if(ok) {
+            emit(@{@"event":@"full_frame_geometry",@"baseWidth":@(info.width),@"baseHeight":@(info.height),@"sourceRegionWidth":@(full.width),@"sourceRegionHeight":@(full.height),@"outputWidth":@(w),@"outputHeight":@(h)});
+            ok=check(ProcessWith(recipe,base,0,0,full,outputSize,aux,&result),@"process_output")&&result;
+        }
+    }
     if(ok)ok=check(Memory(data.mutableBytes,(U)data.length,&stream),@"memory_output")&&stream;
     if(ok)ok=check(Output(result,0x0d,w*3,stream),@"output_bgr24");
     if(stream)Release(stream);if(result)Release(result);if(base)Release(base);if(!ok)return nil;
@@ -100,8 +118,8 @@ static int run(int argc,const char **argv) {
         U wb=0;U wbRC=Get(recipe,0x20101,0,4,&wb);
         emit(@{@"event":@"verified_recipe",@"name":@"whiteBalance",@"expected":@255,@"actual":@(wb),@"rc":@(wbRC)});
         if(wbRC||wb!=255||!verifyD(recipe,0x20001,0,@"exposureEV"))return 1;
-        double warmScale=MIN(1.0,480.0/MAX(w,h));if(!render(recipe,MAX(1,(int)llround(w*warmScale)),MAX(1,(int)llround(h*warmScale))))return 1;
-        NSData *rgb=render(recipe,w,h);if(!rgb)return 1;
+        double warmScale=MIN(1.0,480.0/MAX(w,h));if(!render(recipe,MAX(1,(int)llround(w*warmScale)),MAX(1,(int)llround(h*warmScale)),orientation>=5))return 1;
+        NSData *rgb=render(recipe,w,h,orientation>=5);if(!rgb)return 1;
         const unsigned char *p=rgb.bytes;unsigned char lo=255,hi=0;for(NSUInteger i=0;i<rgb.length;i++){lo=MIN(lo,p[i]);hi=MAX(hi,p[i]);}
         // A uniform photograph can be legitimate; reject only an empty buffer.
         if(rgb.length!=(NSUInteger)w*h*3)return 1;
@@ -125,7 +143,7 @@ int main(int argc,const char **argv) { @autoreleasepool {
 #define BIND(pointer,name) do{pointer=dlsym(module,name);if(!pointer){fprintf(stderr,"missing %s\n",name);return 2;}}while(0)
     BIND(Init,"DppInitializeSDK");BIND(Term,"DppTerminateSDK");BIND(Release,"DppRelease");BIND(CreateFile,"DppCreateFileStream");BIND(CreateServer,"DppCreateImageServer");BIND(Revert,"DppRevertRecipeToCaptured");
     BIND(Set,"DppSetPropertyData");BIND(Get,"DppGetPropertyData");BIND(GetSize,"DppGetPropertySize");BIND(SetStyle,"DppSetPictureStyleFile");BIND(SetProfile,"DppSetPictureStyleUserProfile");
-    BIND(ProcessEx,"DppProcessImageEx");BIND(ProcessWith,"DppProcessImageWithImageEx");BIND(Memory,"DppCreateMemoryStreamFromPointer");BIND(Output,"DppOutputImageToStream");
+    BIND(ProcessEx,"DppProcessImageEx");BIND(ProcessWith,"DppProcessImageWithImageEx");BIND(ImageInfo,"DppGetImageInfo");BIND(Memory,"DppCreateMemoryStreamFromPointer");BIND(Output,"DppOutputImageToStream");
     [NSApplication sharedApplication];if(!check(Init(),@"initialize"))_exit(1);
     int status=run(argc,argv);if(!check(Term(),@"terminate"))status=1;
     // Vendor ObjC plugin autorelease teardown can crash after successful Term.

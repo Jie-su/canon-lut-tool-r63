@@ -684,6 +684,136 @@ struct ContentView: View {
         }.frame(maxWidth: .infinity, alignment: .leading).padding(18)
     }
 
+    private var cubeFolderBrowser: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Button(action: preview.chooseCubeFolder) {
+                    Label("导入预设文件夹…", systemImage: "folder.badge.plus")
+                        .frame(maxWidth: .infinity)
+                }
+                Button(action: preview.refreshCubeFolder) {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .disabled(preview.folderURL == nil || preview.isScanningFolder)
+                .help("重新扫描当前文件夹及子文件夹")
+                .accessibilityLabel("刷新 CUBE / PF3 文件夹")
+            }
+            if let folderError = preview.folderError {
+                Label(folderError, systemImage: "exclamationmark.triangle")
+                    .font(.system(size: 10)).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            }
+            if let folder = preview.folderURL {
+                HStack(spacing: 6) {
+                    Image(systemName: "folder.fill").foregroundStyle(.blue)
+                    Text(folder.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                    Spacer(minLength: 4)
+                    if preview.isScanningFolder { ProgressView().controlSize(.mini) }
+                    else {
+                        Text("\(preview.folderEntries.count) 个")
+                            .foregroundStyle(.secondary).monospacedDigit()
+                    }
+                }
+                .font(.system(size: 11, weight: .medium)).help(folder.path)
+                Toggle("sRGB LUT · 直接套用", isOn: $preview.folderUsesSRGB)
+                    .toggleStyle(.switch).font(.system(size: 11))
+                    .disabled(!preview.folderEntries.contains { !$0.isPF3 })
+                    .help("仅作用于 CUBE：开启时不使用 C-Log 适配。PF3 始终使用预设内置设置。")
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("搜索 CUBE / PF3…", text: $preview.folderSearch)
+                        .textFieldStyle(.plain).font(.system(size: 11))
+                    if !preview.folderSearch.isEmpty {
+                        Button { preview.folderSearch = "" } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                        }.buttonStyle(.plain).accessibilityLabel("清除搜索")
+                    }
+                }
+                .padding(8).background(Color.black.opacity(0.2), in: RoundedRectangle(cornerRadius: 5))
+                if preview.filteredFolderEntries.isEmpty {
+                    Text(preview.isScanningFolder ? "正在查找 CUBE / PF3…" : preview.folderEntries.isEmpty ? "文件夹及子文件夹内没有 CUBE 或 PF3 文件。" : "没有匹配的预设。")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, minHeight: 60)
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 3) {
+                            ForEach(preview.filteredFolderEntries) { entry in
+                                cubeFolderRow(entry)
+                            }
+                        }.padding(4)
+                    }
+                    .frame(height: min(260, CGFloat(preview.filteredFolderEntries.count) * 44 + 8))
+                    .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
+                    .disabled(preview.isScanningFolder)
+                }
+                HStack {
+                    Text("\(preview.lookURL == nil ? "多图对比" : preview.lookKind + " 对比") \(preview.selectedLookURLs.count) / \(PhotoPreviewModel.maximumComparisons)")
+                        .font(.system(size: 10, weight: .medium)).monospacedDigit()
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("清空", action: preview.clearComparisonSelection)
+                        .buttonStyle(.link).font(.system(size: 10))
+                        .disabled(preview.selectedLookURLs.isEmpty)
+                }
+                Text("点击名称预览；最多勾选 \(PhotoPreviewModel.maximumComparisons) 个预设与原图比较。切换 CUBE／PF3 会新建比较组。")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if preview.isScanningFolder {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("正在扫描 CUBE / PF3 文件夹…")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }.padding(.vertical, 6)
+            } else {
+                Text("导入文件夹即可浏览 CUBE 和 PF3，包含子文件夹。")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func cubeFolderRow(_ entry: CubeLibraryEntry) -> some View {
+        let selected = preview.selectedLookURLs.contains(entry.url)
+        let active = preview.lookURL == entry.url
+        let switchesGroup = !preview.selectedLookURLs.isEmpty && entry.isPF3 != preview.isPF3Preview
+        let atLimit = !selected && !switchesGroup && preview.selectedLookURLs.count >= PhotoPreviewModel.maximumComparisons
+        return HStack(spacing: 5) {
+            Button { preview.showFolderCube(entry.url) } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: entry.isPF3 ? "doc.badge.gearshape" : "cube.transparent")
+                        .foregroundStyle(active ? Color.blue : Color.secondary)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(entry.name).font(.system(size: 11, weight: active ? .semibold : .regular))
+                            .lineLimit(1).truncationMode(.middle)
+                        if entry.relativePath != entry.url.lastPathComponent {
+                            Text(entry.relativePath).font(.system(size: 9)).foregroundStyle(.secondary)
+                                .lineLimit(1).truncationMode(.middle)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                    Text(entry.format)
+                        .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(entry.isPF3 ? Color.purple.opacity(0.9) : Color.secondary)
+                        .padding(.horizontal, 4).padding(.vertical, 3)
+                        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 3))
+                }.frame(maxWidth: .infinity, minHeight: 32, alignment: .leading).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).help(entry.url.path)
+            .accessibilityLabel("预览 \(entry.name)")
+            Button { preview.toggleComparisonLook(entry.url) } label: {
+                Image(systemName: selected ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 15)).foregroundStyle(selected ? Color.blue : Color.secondary)
+                    .frame(width: 26, height: 32).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(atLimit)
+            .accessibilityLabel("\(selected ? "从对比中移除" : "加入多图对比") \(entry.name)")
+            .help(selected ? "从对比中移除" : atLimit ? "最多同时对比 \(PhotoPreviewModel.maximumComparisons) 个预设" : switchesGroup ? "切换到 \(entry.format) 比较组，并选择此预设" : "加入多图对比")
+        }
+        .padding(.leading, 8).padding(.trailing, 3).padding(.vertical, 2)
+        .background(active ? Color.blue.opacity(0.16) : Color.clear, in: RoundedRectangle(cornerRadius: 4))
+    }
+
     private var previewSidebar: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
@@ -719,6 +849,8 @@ struct ContentView: View {
                     }
                     Text(preview.profileDescription).font(.system(size: 10)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    Divider().padding(.vertical, 2)
+                    cubeFolderBrowser
                 }
                 Divider()
                 sidebarSection("输入适配", subtitle: "03 / COLOR") {
@@ -726,6 +858,12 @@ struct ContentView: View {
                         Label("使用预设内置设置", systemImage: "checkmark.seal")
                             .font(.system(size: 12, weight: .medium)).foregroundStyle(.blue)
                         Text("PF3 已保存颜色设置，不额外应用 C-Log 适配。若要更改 LUT 输入适配，请选择原始 CUBE。")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if preview.usesFolderSRGB {
+                        Label("sRGB LUT · 直接套用", systemImage: "checkmark.seal")
+                            .font(.system(size: 12, weight: .medium)).foregroundStyle(.blue)
+                        Text("当前文件夹使用普通 sRGB 照片输入，不额外应用 C-Log。切换文件夹中的 CUBE 会保留此设置。")
                             .font(.system(size: 11)).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     } else {

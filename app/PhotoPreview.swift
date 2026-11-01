@@ -172,6 +172,73 @@ enum PhotoPreviewRenderer {
     }
 }
 
+struct CubeLibraryEntry: Identifiable {
+    let url: URL
+    let relativePath: String
+    var id: URL { url }
+    var name: String { url.deletingPathExtension().lastPathComponent }
+    var isPF3: Bool { url.pathExtension.lowercased() == "pf3" }
+    var format: String { isPF3 ? "PF3" : "CUBE" }
+}
+
+struct CubeComparisonItem: Identifiable {
+    let url: URL
+    var image: CGImage?
+    var error: String?
+    var isRendering = false
+    var id: URL { url }
+    var name: String { url.deletingPathExtension().lastPathComponent }
+}
+
+enum CubeFolderScanner {
+    static func entries(in directory: URL, cancellation: PhotoPreviewCancellation) throws -> [CubeLibraryEntry] {
+        let root = directory.standardizedFileURL.resolvingSymlinksInPath()
+        let manager = FileManager.default
+        let values = try root.resourceValues(forKeys: [.isDirectoryKey])
+        guard values.isDirectory == true, manager.isReadableFile(atPath: root.path) else {
+            throw PhotoPreviewError.message("无法读取这个文件夹，请重新选择可访问的文件夹。")
+        }
+        var firstError: Error?
+        guard let enumerator = manager.enumerator(at: root,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants], errorHandler: { _, error in
+                firstError = error
+                return false
+            }) else { throw PhotoPreviewError.message("无法浏览这个文件夹。") }
+        var result: [CubeLibraryEntry] = []
+        var seen: Set<URL> = []
+        for case let url as URL in enumerator {
+            try cancellation.check()
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            if values.isSymbolicLink == true { continue }
+            guard values.isRegularFile == true,
+                  ["cube", "pf3"].contains(url.pathExtension.lowercased()) else { continue }
+            let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
+            let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+            guard canonical.path.hasPrefix(prefix) else { throw PhotoPreviewError.message("文件夹路径发生变化，请重新导入。") }
+            guard seen.insert(canonical).inserted else { continue }
+            let relative = String(canonical.path.dropFirst(prefix.count))
+            result.append(CubeLibraryEntry(url: canonical, relativePath: relative))
+        }
+        try cancellation.check()
+        if let error = firstError {
+            throw PhotoPreviewError.message("文件夹内有无法读取的目录：\(error.localizedDescription)")
+        }
+        return result.sorted {
+            let order = $0.relativePath.localizedStandardCompare($1.relativePath)
+            return order == .orderedSame ? $0.relativePath < $1.relativePath : order == .orderedAscending
+        }
+    }
+}
+
+struct PF3PreviewOutput {
+    let before: CGImage
+    let after: CGImage
+    let isRaw: Bool
+    let mode: String
+    let label: String
+}
+
 final class PhotoPreviewModel: ObservableObject {
     @Published private(set) var photoURL: URL?
     @Published private(set) var cubeURL: URL?
@@ -195,15 +262,242 @@ final class PhotoPreviewModel: ObservableObject {
         default: return "RAW 先由 macOS 显影；此处展示 LUT 近似效果，与机内 PF3 成像可能不同。"
         }
     }
-    @Published var comparisonMode = "side"
+    @Published private(set) var folderURL: URL?
+    @Published private(set) var folderEntries: [CubeLibraryEntry] = []
+    @Published var folderSearch = ""
+    @Published private(set) var isScanningFolder = false
+    @Published private(set) var folderError: String?
+    @Published var folderUsesSRGB = true {
+        didSet {
+            let hasFolderResult = comparisonMode == "compare" && selectedCubeURLs.contains { url in folderEntries.contains { $0.url == url } }
+            if oldValue != folderUsesSRGB, !changingSelection, usesFolderLook || hasFolderResult {
+                updateProfileDescription(); render()
+            }
+        }
+    }
+    @Published private(set) var selectedCubeURLs: [URL] = []
+    @Published private(set) var selectedPF3URLs: [URL] = []
+    var selectedLookURLs: [URL] { selectedPF3URLs.isEmpty ? selectedCubeURLs : selectedPF3URLs }
+    @Published private(set) var comparisonItems: [CubeComparisonItem] = []
+    static let maximumComparisons = 8
+    var filteredFolderEntries: [CubeLibraryEntry] {
+        let query = folderSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        return query.isEmpty ? folderEntries : folderEntries.filter { $0.relativePath.localizedStandardContains(query) }
+    }
+    private var usesFolderLook: Bool {
+        guard pf3URL == nil, let cube = cubeURL else { return false }
+        return folderEntries.contains { $0.url == cube }
+    }
+    var usesFolderSRGB: Bool { folderUsesSRGB && usesFolderLook }
+    @Published var comparisonMode = "compare" {
+        didSet {
+            guard oldValue != comparisonMode, !changingSelection else { return }
+            render()
+        }
+    }
     @Published var splitPosition = 0.5
+    // The viewer shares these values across every look and keeps them when
+    // only the preset changes. The centre uses image coordinates with its
+    // origin at the top-left, independently of the AppKit view's orientation.
+    @Published private(set) var previewZoomPercent = 0
+    @Published private(set) var previewZoomCenter = CGPoint(x: 0.5, y: 0.5)
+    private var rememberedPreviewZoomPercent = 200
     private var configuration = ["none","cinema-gamut","gamma24"]
     private var decoded: PreviewDecodedPhoto?
-    private var lookup: PreviewLookup?
-    private var lookupKey: String?
     private var token = PhotoPreviewCancellation()
+    private var folderToken = PhotoPreviewCancellation()
+    private var changingSelection = false
+    private var lookupCache: [String: PreviewLookup] = [:]
+    private var resultCache: [String: CGImage] = [:]
+    private var cacheOrder: [String] = []
+    private var pf3Cache: [String: PF3PreviewOutput] = [:]
+    private var pf3CacheOrder: [String] = []
+    private var pf3ReferenceMode: String?
+    private let resourcesURL: URL?
+    private let helperURL: URL?
+    private let pf3PreviewRenderer: ((URL, URL, PhotoPreviewCancellation) throws -> PF3PreviewOutput)?
     private let queue = DispatchQueue(label: "dev.canonlut.photo-preview", qos: .userInitiated)
-    deinit { token.cancel() }
+    private let folderQueue = DispatchQueue(label: "dev.canonlut.cube-folder", qos: .userInitiated)
+    init(resourcesURL: URL? = Bundle.main.resourceURL, helperURL: URL? = nil,
+         pf3PreviewRenderer: ((URL, URL, PhotoPreviewCancellation) throws -> PF3PreviewOutput)? = nil) {
+        self.resourcesURL = resourcesURL
+        self.helperURL = helperURL ?? resourcesURL?.deletingLastPathComponent().appendingPathComponent("MacOS/native_pf3_preview")
+        self.pf3PreviewRenderer = pf3PreviewRenderer
+    }
+    deinit { token.cancel(); folderToken.cancel() }
+
+    private func effectiveConfiguration(for cube: URL) -> [String] {
+        if folderUsesSRGB, folderEntries.contains(where: { $0.url == cube }) { return ["none", "bt709", "srgb"] }
+        return configuration
+    }
+
+    private func updateProfileDescription() {
+        guard pf3URL == nil else { return }
+        let config = cubeURL.map { effectiveConfiguration(for: $0) } ?? configuration
+        let adaptation = config[0], logGamut = config[1], lutOutput = config[2]
+        profileDescription = usesFolderSRGB ? "CUBE · sRGB 直接套用 · 无 Log 适配" : adaptation == "none" ? "CUBE · 普通 LUT 直接应用" : "CUBE · C-Log \(adaptation == "clog2" ? "2" : "3") 照片适配 · \(logGamut == "cinema-gamut" ? "Cinema Gamut" : logGamut.uppercased()) · \(lutOutput == "same-log" ? "Log 输出" : lutOutput == "gamma24" ? "Gamma 2.4 输出" : "sRGB 输出")"
+    }
+
+    func chooseCubeFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "导入 CUBE / PF3 文件夹（包括子文件夹）"
+        panel.canChooseDirectories = true; panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url { loadCubeFolder(url) }
+    }
+
+    func refreshCubeFolder() { if let url = folderURL { loadCubeFolder(url, refreshing: true) } }
+
+    func loadCubeFolder(_ url: URL) { loadCubeFolder(url, refreshing: false) }
+
+    private func loadCubeFolder(_ url: URL, refreshing: Bool) {
+        folderToken.cancel(); folderToken = PhotoPreviewCancellation()
+        let current = folderToken, directory = url.standardizedFileURL.resolvingSymlinksInPath()
+        folderError = nil; isScanningFolder = true
+        folderQueue.async {
+            do {
+                let entries = try CubeFolderScanner.entries(in: directory, cancellation: current)
+                DispatchQueue.main.async {
+                    guard self.folderToken === current else { return }
+                    self.changingSelection = true
+                    self.folderURL = directory
+                    if !refreshing { self.folderSearch = ""; self.folderUsesSRGB = true }
+                    self.folderEntries = entries; self.isScanningFolder = false
+                    let available = Set(entries.map(\.url))
+                    self.selectedCubeURLs = self.selectedCubeURLs.filter { available.contains($0) && $0.pathExtension.lowercased() == "cube" }
+                    self.selectedPF3URLs = self.selectedPF3URLs.filter { available.contains($0) && $0.pathExtension.lowercased() == "pf3" }
+                    if !refreshing {
+                        let first = entries.first
+                        self.pf3URL = first?.isPF3 == true ? first?.url : nil
+                        self.cubeURL = first?.isPF3 == false ? first?.url : nil
+                        self.selectedCubeURLs = self.cubeURL.map { [$0] } ?? []
+                        self.selectedPF3URLs = self.pf3URL.map { [$0] } ?? []
+                        self.decoded = nil; self.before = nil; self.after = nil
+                    } else if self.lookURL.map({ !available.contains($0) }) == true {
+                        if self.pf3URL != nil { self.pf3URL = self.selectedPF3URLs.first }
+                        else { self.cubeURL = self.selectedCubeURLs.first }
+                        self.before = nil; self.after = nil
+                    }
+                    if self.pf3URL != nil { self.setPendingPF3Labels() }
+                    else { self.previewMethod = "cube"; self.previewMethodSummary = "CUBE · 照片近似" }
+                    self.changingSelection = false
+                    self.updateProfileDescription()
+                    self.render()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard self.folderToken === current, !current.isCancelled else { return }
+                    self.isScanningFolder = false; self.folderError = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    func showFolderCube(_ url: URL) {
+        guard let entry = folderEntries.first(where: { $0.url == url }) else { return }
+        if entry.isPF3 {
+            if selectedPF3URLs.count > 1 {
+                if selectedPF3URLs.contains(url) { focusComparisonLook(url) }
+                else { toggleComparisonLook(url); focusComparisonLook(url) }
+            } else { folderError = nil; configurePF3(url: url) }
+            return
+        }
+        if selectedCubeURLs.count > 1 {
+            if !selectedCubeURLs.contains(url) {
+                guard selectedCubeURLs.count < Self.maximumComparisons else {
+                    folderError = "最多同时对比 8 个 CUBE，加上原图共 9 张，请先取消一个选择。"; return
+                }
+                selectedCubeURLs.append(url)
+                changingSelection = true; comparisonMode = "compare"; changingSelection = false
+                cubeURL = url; pf3URL = nil; selectedPF3URLs = []; folderError = nil
+                updateProfileDescription(); render()
+            } else { focusComparisonCube(url) }
+        } else {
+            selectedCubeURLs = [url]
+            configure(cubeURL: url, adaptation: configuration[0], logGamut: configuration[1], lutOutput: configuration[2])
+        }
+    }
+
+    func toggleComparisonLook(_ url: URL) {
+        if url.pathExtension.lowercased() != "pf3" { toggleComparisonCube(url); return }
+        guard selectedPF3URLs.contains(url) || folderEntries.contains(where: { $0.url == url && $0.isPF3 }) else { return }
+        let switchedFamily = !selectedCubeURLs.isEmpty || cubeURL != nil
+        if selectedPF3URLs.contains(url) { selectedPF3URLs.removeAll { $0 == url } }
+        else {
+            guard selectedPF3URLs.count < Self.maximumComparisons else {
+                folderError = "最多同时对比 8 个 PF3，加上原图共 9 张，请先取消一个选择。"; return
+            }
+            selectedPF3URLs.append(url)
+        }
+        changingSelection = true; comparisonMode = "compare"; changingSelection = false
+        selectedCubeURLs = []; cubeURL = nil
+        if pf3URL == nil || !selectedPF3URLs.contains(pf3URL!) { pf3URL = selectedPF3URLs.last }
+        if switchedFamily { decoded = nil; before = nil }
+        if pf3URL != nil { setPendingPF3Labels() }
+        else {
+            pf3ReferenceMode = nil; previewMethod = "cube"; previewMethodSummary = "CUBE · 照片近似"
+            before = nil; updateProfileDescription()
+        }
+        folderError = nil; render()
+    }
+
+    func toggleComparisonCube(_ url: URL) {
+        guard url.pathExtension.lowercased() == "cube" else { return }
+        guard selectedCubeURLs.contains(url) || folderEntries.contains(where: { $0.url == url }) else { return }
+        if selectedCubeURLs.contains(url) { selectedCubeURLs.removeAll { $0 == url } }
+        else {
+            guard selectedCubeURLs.count < Self.maximumComparisons else {
+                folderError = "最多同时对比 8 个 CUBE，加上原图共 9 张，请先取消一个选择。"; return
+            }
+            selectedCubeURLs.append(url)
+        }
+        changingSelection = true; comparisonMode = "compare"; changingSelection = false
+        let changedKind = pf3URL != nil
+        pf3URL = nil; selectedPF3URLs = []; previewMethod = "cube"; previewMethodSummary = "CUBE · 照片近似"
+        if changedKind { decoded = nil; before = nil }
+        if cubeURL == nil || !selectedCubeURLs.contains(cubeURL!) { cubeURL = selectedCubeURLs.last }
+        folderError = nil; updateProfileDescription(); render()
+    }
+
+    func clearComparisonSelection() {
+        selectedCubeURLs = []; selectedPF3URLs = []; comparisonItems = []
+        cubeURL = nil; pf3URL = nil; after = nil
+        pf3ReferenceMode = nil; previewMethod = "cube"; previewMethodSummary = "CUBE · 照片近似"
+        updateProfileDescription()
+        folderError = nil; render()
+    }
+
+    func focusComparisonLook(_ url: URL) {
+        if url.pathExtension.lowercased() != "pf3" { focusComparisonCube(url); return }
+        guard selectedPF3URLs.contains(url) else { return }
+        pf3URL = url; cubeURL = nil; error = nil
+        if comparisonMode == "split" { render() }
+        else {
+            after = comparisonItems.first { $0.url == url }?.image
+            if let photo = photoURL,
+               let output = pf3Cache[pf3CacheKey(pf3: url, photo: photo)], output.mode == pf3ReferenceMode, after != nil {
+                setPF3Labels(output)
+            }
+            if !isRendering, after == nil { status = "所选 PF3 未完成预览，请查看对应视图中的提示。" }
+        }
+    }
+
+    func focusComparisonCube(_ url: URL) {
+        guard selectedCubeURLs.contains(url) else { return }
+        cubeURL = url; updateProfileDescription()
+        if comparisonMode == "split" { render() }
+        else { after = comparisonItems.first { $0.url == url }?.image }
+    }
+
+    private func setPendingPF3Labels() {
+        profileDescription = "PF3 · 文件内保存的颜色设置"
+        previewMethod = "pending-pf3"; previewMethodSummary = "PF3 · 等待识别"
+    }
+
+    private func setPF3Labels(_ output: PF3PreviewOutput) {
+        previewMethod = output.mode; previewMethodSummary = output.label
+        profileDescription = output.label + " · 不额外应用 C-Log"
+    }
 
     func configure(cubeURL: URL?, adaptation: String, logGamut: String, lutOutput: String) {
         let newConfiguration = [adaptation,logGamut,lutOutput]
@@ -215,22 +509,24 @@ final class PhotoPreviewModel: ObservableObject {
         }
         let changedKind = pf3URL != nil
         guard changedKind || newConfiguration != configuration || cubeURL != self.cubeURL else { return }
-        pf3URL = nil
+        if cubeURL != self.cubeURL || changedKind {
+            selectedCubeURLs = cubeURL.map { [$0] } ?? []
+            comparisonItems = []
+        }
+        pf3URL = nil; selectedPF3URLs = []
         previewMethod = "cube"; previewMethodSummary = "CUBE · 照片近似"
         self.cubeURL = cubeURL
         configuration = newConfiguration
-        profileDescription = adaptation == "none" ? "CUBE · 普通 LUT 直接应用" : "CUBE · C-Log \(adaptation == "clog2" ? "2" : "3") 照片适配 · \(logGamut == "cinema-gamut" ? "Cinema Gamut" : logGamut.uppercased()) · \(lutOutput == "same-log" ? "Log 输出" : lutOutput == "gamma24" ? "Gamma 2.4 输出" : "sRGB 输出")"
-        lookup = nil; lookupKey = nil
+        updateProfileDescription()
         if changedKind { decoded = nil; before = nil; after = nil }
         render()
     }
 
     func configurePF3(url: URL) {
+        selectedCubeURLs = []; selectedPF3URLs = [url]; comparisonItems = []
         pf3URL = url; cubeURL = nil
-        profileDescription = "PF3 · 文件内保存的颜色设置"
-        previewMethod = "pending-pf3"; previewMethodSummary = "PF3 · 等待识别"
-        decoded = nil; lookup = nil; lookupKey = nil
-        before = nil; after = nil
+        setPendingPF3Labels()
+        decoded = nil; before = nil; after = nil
         render()
     }
 
@@ -242,8 +538,31 @@ final class PhotoPreviewModel: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url { loadPhoto(url) }
     }
 
+    func setPreviewZoomPercent(_ percent: Int) {
+        guard [0, 100, 150, 200].contains(percent) else { return }
+        if percent > 0 { rememberedPreviewZoomPercent = percent }
+        previewZoomPercent = percent
+    }
+
+    func togglePreviewZoom(at point: CGPoint) {
+        guard point.x.isFinite, point.y.isFinite else { return }
+        if previewZoomPercent > 0 {
+            previewZoomPercent = 0
+        } else {
+            previewZoomCenter = CGPoint(x: min(1, max(0, point.x)), y: min(1, max(0, point.y)))
+            previewZoomPercent = rememberedPreviewZoomPercent
+        }
+    }
+
+    func resetPreviewZoom() {
+        previewZoomPercent = 0
+        previewZoomCenter = CGPoint(x: 0.5, y: 0.5)
+    }
+
     func loadPhoto(_ url: URL) {
+        resetPreviewZoom()
         photoURL = url; decoded = nil; before = nil; after = nil
+        resultCache = [:]; pf3Cache = [:]; pf3CacheOrder = []
         render()
     }
 
@@ -264,23 +583,53 @@ final class PhotoPreviewModel: ObservableObject {
 
     func cancel() {
         token.cancel(); token = PhotoPreviewCancellation()
+        comparisonItems = comparisonItems.map { CubeComparisonItem(url: $0.url, image: $0.image, error: $0.error, isRendering: false) }
         isRendering = false; status = "预览已取消，可重新生成。"
+    }
+
+    private static func cacheKey(cube: URL, configuration: [String]) -> String {
+        let values = try? cube.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        let modified = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
+        return cube.path + "|\(modified)|\(values?.fileSize ?? 0)|" + configuration.joined(separator: "|")
+    }
+
+    private func storeCached(_ table: PreviewLookup, image: CGImage, key: String) {
+        lookupCache[key] = table; resultCache[key] = image
+        cacheOrder.removeAll { $0 == key }; cacheOrder.append(key)
+        // Eight selected looks plus a few recently inspected alternatives.
+        while cacheOrder.count > 12 {
+            let oldest = cacheOrder.removeFirst()
+            lookupCache.removeValue(forKey: oldest); resultCache.removeValue(forKey: oldest)
+        }
     }
 
     func render() {
         token.cancel(); token = PhotoPreviewCancellation()
         let current = token
         error = nil; after = nil
-        guard let photo = photoURL else { isRendering = false; status = "先导入一张照片，再选择 CUBE 或 PF3。"; return }
-        if let pf3 = pf3URL {
-            renderPF3(pf3, photo: photo, cancellation: current)
+        guard let photo = photoURL else {
+            comparisonItems = comparisonMode == "compare" ? selectedLookURLs.map { CubeComparisonItem(url: $0) } : []
+            isRendering = false; status = "先导入一张照片，再选择 CUBE 或 PF3。"; return
+        }
+        if pf3URL != nil {
+            renderPF3(photo: photo, cancellation: current)
             return
         }
-        let cube = cubeURL, config = configuration, cachedPhoto = decoded, cachedLookup = lookup
-        let oldKey = lookupKey
+        updateProfileDescription()
+        let grid = comparisonMode == "compare"
+        let cubes = grid ? selectedCubeURLs : cubeURL.map { [$0] } ?? []
+        let tasks = cubes.map { cube -> (url: URL, config: [String], key: String) in
+            let config = effectiveConfiguration(for: cube)
+            return (cube, config, Self.cacheKey(cube: cube, configuration: config))
+        }
+        let cachedPhoto = decoded, cachedTables = lookupCache, cachedResults = resultCache
+        comparisonItems = grid ? tasks.map {
+            CubeComparisonItem(url: $0.url, image: cachedResults[$0.key], isRendering: cachedResults[$0.key] == nil)
+        } : []
+        if let active = tasks.first(where: { $0.url == cubeURL }) { after = cachedResults[active.key] }
         isRendering = true
-        status = cachedPhoto == nil ? "正在读取照片…" : "正在生成套用后预览…"
-        let resources = Bundle.main.resourceURL
+        status = cachedPhoto == nil ? "正在读取照片…" : grid ? "正在生成多图对比…" : "正在生成套用后预览…"
+        let resources = resourcesURL
         queue.async {
             do {
                 let source = try cachedPhoto ?? PhotoPreviewRenderer.decode(photo, cancellation: current)
@@ -288,73 +637,151 @@ final class PhotoPreviewModel: ObservableObject {
                 DispatchQueue.main.async {
                     guard self.token === current else { return }
                     self.decoded = source; self.before = source.image
-                    self.status = cube == nil ? "照片已读取，请选择 CUBE 或 PF3。" : "正在应用 CUBE LUT…"
+                    self.status = cubes.isEmpty ? "照片已读取，请选择 CUBE 或 PF3。" : "正在应用 CUBE LUT…"
                 }
-                guard let cube = cube else {
-                    DispatchQueue.main.async { if self.token === current { self.isRendering = false } }
-                    return
+                var completed = 0, failed = 0
+                for task in tasks {
+                    try current.check()
+                    do {
+                        let table: PreviewLookup
+                        if let cached = cachedTables[task.key] { table = cached }
+                        else {
+                            guard let resources = resources else { throw PhotoPreviewError.message("预览运行环境缺失，请重新构建应用。") }
+                            table = try Self.prepareLookup(cube: task.url, configuration: task.config,
+                                                           resources: resources, cancellation: current)
+                        }
+                        let output = try cachedResults[task.key] ?? PhotoPreviewRenderer.apply(table, to: source, cancellation: current)
+                        try current.check()
+                        completed += 1
+                        let count = completed + failed
+                        DispatchQueue.main.async {
+                            guard self.token === current else { return }
+                            self.storeCached(table, image: output, key: task.key)
+                            if let index = self.comparisonItems.firstIndex(where: { $0.url == task.url }) {
+                                self.comparisonItems[index] = CubeComparisonItem(url: task.url, image: output)
+                            }
+                            if self.cubeURL == task.url { self.after = output }
+                            self.status = grid ? "已完成 \(count)/\(tasks.count) 个 CUBE · \(task.url.lastPathComponent)" : "预览已生成"
+                        }
+                    } catch {
+                        try current.check()
+                        failed += 1
+                        let message = error.localizedDescription
+                        DispatchQueue.main.async {
+                            guard self.token === current else { return }
+                            if grid, let index = self.comparisonItems.firstIndex(where: { $0.url == task.url }) {
+                                self.comparisonItems[index] = CubeComparisonItem(url: task.url, error: message)
+                            } else { self.error = message }
+                        }
+                    }
                 }
-                let modified = (try? cube.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate?.timeIntervalSince1970) ?? 0
-                let key = cube.path + "|\(modified)|" + config.joined(separator: "|")
-                let table: PreviewLookup
-                if oldKey == key, let cached = cachedLookup { table = cached }
-                else {
-                    guard let resources = resources else { throw PhotoPreviewError.message("预览运行环境缺失，请重新构建应用。") }
-                    table = try Self.prepareLookup(cube: cube, configuration: config, resources: resources, cancellation: current)
-                }
-                let output = try PhotoPreviewRenderer.apply(table, to: source, cancellation: current)
                 try current.check()
+                let succeeded = completed, failures = failed
                 DispatchQueue.main.async {
                     guard self.token === current else { return }
-                    self.lookup = table; self.lookupKey = key; self.after = output; self.isRendering = false
-                    self.status = "\(source.isRaw ? "RAW 已显影" : "照片已读取") · \(source.width) × \(source.height) 预览 · 原文件保持不变"
+                    self.isRendering = false
+                    if tasks.isEmpty { self.status = grid ? "勾选文件夹中的 CUBE，最多 8 个 CUBE，加上 1 张原图。" : "照片已读取，请选择 CUBE 或 PF3。" }
+                    else if grid { self.status = "\(succeeded)/\(tasks.count) 个效果已完成\(failures == 0 ? "" : " · \(failures) 个失败，可单独取消选择") · 点击结果选择导出 · 原文件保持不变" }
+                    else { self.status = failures == 0 ? "\(source.isRaw ? "RAW 已显影" : "照片已读取") · \(source.width) × \(source.height) 预览 · 原文件保持不变" : "未能生成预览。" }
                 }
             } catch {
                 DispatchQueue.main.async {
                     guard self.token === current else { return }
                     self.isRendering = false
                     if current.isCancelled { return }
-                    self.error = error.localizedDescription; self.status = "未能生成预览。"
+                    self.comparisonItems = self.comparisonItems.map { CubeComparisonItem(url: $0.url, error: error.localizedDescription) }
+                    self.error = error.localizedDescription; self.status = "未能读取照片。"
                 }
             }
         }
     }
 
-    private func renderPF3(_ pf3: URL, photo: URL, cancellation current: PhotoPreviewCancellation) {
-        isRendering = true; before = nil
-        status = "正在读取 PF3 并生成预览…"
-        let resources = Bundle.main.resourceURL
-        let helper = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("native_pf3_preview")
+    private func pf3CacheKey(pf3: URL, photo: URL) -> String {
+        "pf3-photo-v2|" + Self.cacheKey(cube: photo, configuration: []) + "|" +
+            Self.cacheKey(cube: pf3, configuration: []) + "|" +
+            (helperURL.map { Self.cacheKey(cube: $0, configuration: []) } ?? "injected-renderer")
+    }
+
+    private func storePF3Cached(_ output: PF3PreviewOutput, key: String) {
+        pf3Cache[key] = output
+        pf3CacheOrder.removeAll { $0 == key }; pf3CacheOrder.append(key)
+        while pf3CacheOrder.count > 12 {
+            pf3Cache.removeValue(forKey: pf3CacheOrder.removeFirst())
+        }
+    }
+
+    private func renderPF3(photo: URL, cancellation current: PhotoPreviewCancellation) {
+        let grid = comparisonMode == "compare"
+        let urls = grid ? selectedPF3URLs : pf3URL.map { [$0] } ?? []
+        let tasks = urls.map { (url: $0, key: pf3CacheKey(pf3: $0, photo: photo)) }
+        let cached = pf3Cache, resources = resourcesURL, helper = helperURL, renderer = pf3PreviewRenderer
+        pf3ReferenceMode = nil; isRendering = true; before = nil
+        comparisonItems = grid ? urls.map { CubeComparisonItem(url: $0, isRendering: true) } : []
+        status = grid && urls.count > 1 ? "正在逐项生成 PF3 多图预览…" : "正在读取 PF3 并生成预览…"
         queue.async {
-            do {
-                guard let resources = resources, let helper = helper else {
-                    throw PhotoPreviewError.message("应用缺少 PF3 预览运行环境，请重新安装或构建当前版本。")
-                }
-                let output = try Self.preparePF3(pf3: pf3, photo: photo, resources: resources,
-                                                 helper: helper, cancellation: current)
-                try current.check()
-                DispatchQueue.main.async {
-                    guard self.token === current else { return }
-                    self.before = output.before; self.after = output.after
-                    self.isRendering = false
-                    self.previewMethod = output.mode
-                    self.previewMethodSummary = output.label
-                    self.profileDescription = output.label + " · 不额外应用 C-Log"
-                    self.status = "\(output.label) · \(output.before.width) × \(output.before.height) · \(output.isRaw ? "RAW" : "照片") · 非机内实拍"
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    guard self.token === current else { return }
-                    self.isRendering = false
+            var reference: PF3PreviewOutput?, completed = 0, failed = 0
+            for task in tasks {
+                do {
+                    try current.check()
+                    let output: PF3PreviewOutput
+                    if let value = cached[task.key] { output = value }
+                    else if let renderer = renderer { output = try renderer(task.url, photo, current) }
+                    else {
+                        guard let resources = resources, let helper = helper else {
+                            throw PhotoPreviewError.message("应用缺少 PF3 预览运行环境，请重新安装或构建当前版本。")
+                        }
+                        output = try Self.preparePF3(pf3: task.url, photo: photo, resources: resources,
+                                                     helper: helper, cancellation: current)
+                    }
+                    try current.check()
+                    DispatchQueue.main.async {
+                        guard self.token === current else { return }
+                        self.storePF3Cached(output, key: task.key)
+                    }
+                    if let reference = reference, reference.mode != output.mode {
+                        throw PhotoPreviewError.message("显影基准不同，请单独查看。原生 PF3 与内嵌色表 PF3 不能共用同一张原图比较。")
+                    }
+                    if reference == nil { reference = output }
+                    let currentReference = reference!
+                    completed += 1
+                    let count = completed + failed
+                    DispatchQueue.main.async {
+                        guard self.token === current else { return }
+                        self.pf3ReferenceMode = currentReference.mode
+                        self.before = currentReference.before
+                        if let index = self.comparisonItems.firstIndex(where: { $0.url == task.url }) {
+                            self.comparisonItems[index] = CubeComparisonItem(url: task.url, image: output.after)
+                        }
+                        if self.pf3URL == task.url { self.after = output.after }
+                        self.setPF3Labels(currentReference)
+                        self.status = grid ? "已完成 \(count)/\(tasks.count) 个 PF3 · \(task.url.lastPathComponent)" : "\(output.label) · \(output.before.width) × \(output.before.height) · \(output.isRaw ? "RAW" : "照片") · 非机内实拍"
+                    }
+                } catch {
                     if current.isCancelled { return }
-                    self.error = error.localizedDescription; self.status = "未能生成 PF3 预览。"
+                    failed += 1
+                    let message = error.localizedDescription
+                    DispatchQueue.main.async {
+                        guard self.token === current else { return }
+                        if let index = self.comparisonItems.firstIndex(where: { $0.url == task.url }) {
+                            self.comparisonItems[index] = CubeComparisonItem(url: task.url, error: message)
+                        } else { self.error = message }
+                    }
                 }
+            }
+            guard !current.isCancelled else { return }
+            let successes = completed, failures = failed
+            DispatchQueue.main.async {
+                guard self.token === current else { return }
+                self.isRendering = false
+                if grid {
+                    self.status = "\(successes)/\(tasks.count) 个 PF3 效果已完成\(failures == 0 ? "" : " · \(failures) 个失败，可单独查看") · 点击结果选择导出 · 非机内实拍"
+                } else if failures > 0 { self.status = "未能生成 PF3 预览。" }
             }
         }
     }
 
     private static func preparePF3(pf3: URL, photo: URL, resources: URL, helper: URL,
-                                   cancellation: PhotoPreviewCancellation) throws -> (before: CGImage, after: CGImage, isRaw: Bool, mode: String, label: String) {
+                                   cancellation: PhotoPreviewCancellation) throws -> PF3PreviewOutput {
         try cancellation.check()
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("CanonPF3Preview-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: temporary) }
@@ -402,7 +829,7 @@ final class PhotoPreviewModel: ObservableObject {
             guard currentPhotoHash == photoHash, currentPF3Hash == pf3Hash else {
                 throw PhotoPreviewError.message("照片或 PF3 在生成期间发生变化，请重新预览。")
             }
-            return (decoded.image, after, decoded.isRaw, mode, "PF3 内嵌色表 · 照片近似")
+            return PF3PreviewOutput(before: decoded.image, after: after, isRaw: decoded.isRaw, mode: mode, label: "PF3 内嵌色表 · 照片近似")
         }
         guard mode == "native", let width = metadata["width"] as? Int,
               let height = metadata["height"] as? Int, width > 0, height > 0,
@@ -419,7 +846,7 @@ final class PhotoPreviewModel: ObservableObject {
         }
         let before = try readPNG("before.png"), after = try readPNG("after.png")
         try cancellation.check()
-        return (before, after, isRaw, mode, "Canon 原生 PF3 离线显影")
+        return PF3PreviewOutput(before: before, after: after, isRaw: isRaw, mode: mode, label: "Canon 原生 PF3 离线显影")
     }
 
     private static func prepareLookup(cube: URL, configuration: [String], resources: URL,
@@ -462,295 +889,5 @@ final class PhotoPreviewModel: ObservableObject {
         CGImageDestinationAddImage(destination, image, [kCGImagePropertyProfileName: "sRGB"] as CFDictionary)
         if !CGImageDestinationFinalize(destination) { error = "预览图片保存失败。" }
         else { error = nil; status = "预览已导出：\(url.lastPathComponent) · 原文件保持不变" }
-    }
-}
-
-// The preview is a fixed work area: controls stay visible while the canvas
-// receives all remaining height. The host provides the import/settings sidebar.
-private enum PreviewStudioColors {
-    static let canvas = Color(red: 0.052, green: 0.060, blue: 0.067)
-    static let panel = Color(red: 0.103, green: 0.115, blue: 0.126)
-    static let raised = Color(red: 0.137, green: 0.152, blue: 0.167)
-    static let line = Color.white.opacity(0.085)
-    static let muted = Color.white.opacity(0.50)
-}
-
-struct PhotoPreviewPanel: View {
-    @ObservedObject var model: PhotoPreviewModel
-    // Retained for compatibility with earlier hosts. The studio canvas expands
-    // with its parent rather than assigning a fixed image height.
-    var imageHeight: CGFloat = 300
-
-    var body: some View {
-        VStack(spacing: 0) {
-            workspaceToolbar
-            rule
-            comparisonCanvas
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            if model.comparisonMode == "split", model.after != nil {
-                splitControl
-                rule
-            }
-            if let error = model.error {
-                HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: "exclamationmark.circle.fill")
-                    Text(error).textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .font(.caption)
-                .foregroundStyle(Color(red: 1, green: 0.56, blue: 0.52))
-                .padding(.horizontal, 16).padding(.vertical, 10)
-                .background(Color.red.opacity(0.08))
-                rule
-            }
-            filmstrip
-            rule
-            statusBar
-        }
-        .background(PreviewStudioColors.panel)
-        .foregroundStyle(.white.opacity(0.88))
-        .preferredColorScheme(.dark)
-    }
-
-    private var rule: some View {
-        Rectangle().fill(PreviewStudioColors.line).frame(height: 1)
-    }
-
-    private var workspaceToolbar: some View {
-        HStack(spacing: 10) {
-            Picker("对比方式", selection: $model.comparisonMode) {
-                Text("左右并排").tag("side")
-                Text("滑动对比").tag("split")
-            }
-            .pickerStyle(.segmented).labelsHidden().frame(width: 190)
-            Text("适合窗口")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(PreviewStudioColors.muted)
-                .padding(.horizontal, 10).padding(.vertical, 7)
-                .background(PreviewStudioColors.raised, in: RoundedRectangle(cornerRadius: 5))
-            Spacer(minLength: 4)
-            if model.isRendering {
-                ProgressView().controlSize(.small).scaleEffect(0.8)
-                Button("取消", action: model.cancel)
-                    .buttonStyle(.bordered).controlSize(.small)
-            } else {
-                Button(action: model.render) {
-                    Label("重新预览", systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(.bordered).controlSize(.small)
-                .disabled(model.photoURL == nil)
-            }
-            Button(action: model.exportPreview) {
-                Label("导出 PNG", systemImage: "square.and.arrow.up")
-            }
-            .buttonStyle(.borderedProminent).controlSize(.small)
-            .disabled(model.after == nil || model.isRendering)
-        }
-        .padding(.horizontal, 14).padding(.vertical, 11)
-        .background(PreviewStudioColors.panel)
-    }
-
-    @ViewBuilder private var comparisonCanvas: some View {
-        if model.comparisonMode == "side" {
-            HStack(spacing: 0) {
-                imagePane(image: model.before, title: "套用前", subtitle: model.previewMethod == "native" ? "CANON NEUTRAL" : "ORIGINAL", isResult: false)
-                Rectangle().fill(PreviewStudioColors.line).frame(width: 1)
-                imagePane(image: model.after, title: "套用后", subtitle: model.isPF3Preview ? "PF3 PREVIEW" : "LUT PREVIEW", isResult: true)
-            }
-            .background(PreviewStudioColors.canvas)
-        } else {
-            VStack(spacing: 0) {
-                HStack {
-                    canvasLabel("套用前", subtitle: model.previewMethod == "native" ? "CANON NEUTRAL" : "ORIGINAL")
-                    Spacer()
-                    canvasLabel("套用后", subtitle: model.isPF3Preview ? "PF3 PREVIEW" : "LUT PREVIEW")
-                }.padding(.horizontal, 16).frame(height: 37)
-                GeometryReader { geometry in
-                    ZStack {
-                        PreviewStudioColors.canvas
-                        if let before = model.before {
-                            splitImage(before: before, available: geometry.size)
-                        } else {
-                            canvasPlaceholder(isResult: false)
-                        }
-                    }
-                }
-                if model.after == nil, model.before != nil {
-                    HStack(spacing: 6) {
-                        if model.isRendering { ProgressView().controlSize(.mini) }
-                        Text(pendingResultText).font(.caption)
-                    }
-                    .foregroundStyle(PreviewStudioColors.muted)
-                    .padding(.bottom, 10)
-                }
-            }.background(PreviewStudioColors.canvas)
-        }
-    }
-
-    private func canvasLabel(_ title: String, subtitle: String) -> some View {
-        HStack(spacing: 8) {
-            Text(title).font(.system(size: 11, weight: .medium))
-            Text(subtitle).font(.system(size: 9, weight: .medium, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.28))
-        }
-        .foregroundStyle(PreviewStudioColors.muted)
-    }
-
-    private func imagePane(image: CGImage?, title: String, subtitle: String, isResult: Bool) -> some View {
-        VStack(spacing: 0) {
-            HStack { canvasLabel(title, subtitle: subtitle); Spacer(minLength: 0) }
-                .padding(.horizontal, 16).frame(height: 37)
-            ZStack {
-                PreviewStudioColors.canvas
-                if let image = image {
-                    Image(decorative: image, scale: 1).resizable().scaledToFit()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .accessibilityLabel(isResult ? "套用预设后的照片预览" : "套用预设前的照片预览")
-                } else {
-                    canvasPlaceholder(isResult: isResult)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .clipped()
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var pendingResultText: String {
-        if model.isRendering { return "正在生成套用后预览…" }
-        if model.error != nil { return "预览未完成，请查看下方提示" }
-        if model.photoURL == nil { return "导入照片后在这里查看效果" }
-        if model.lookURL == nil { return "选择 CUBE 或 PF3 后生成预览" }
-        return "点击“重新预览”生成效果"
-    }
-
-    private func canvasPlaceholder(isResult: Bool) -> some View {
-        VStack(spacing: 12) {
-            if model.isRendering {
-                ProgressView().controlSize(.regular)
-            } else {
-                Image(systemName: isResult ? "slider.horizontal.3" : "photo.on.rectangle.angled")
-                    .font(.system(size: 29, weight: .light))
-                    .foregroundStyle(.white.opacity(0.25))
-            }
-            Text(isResult ? pendingResultText : model.isRendering ? "正在读取照片…" : "导入一张照片")
-                .font(.system(size: 12, weight: .medium))
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.white.opacity(0.60))
-            if !isResult, model.photoURL == nil {
-                Text("JPEG · PNG · HEIC · TIFF · RAW / CR3")
-                    .font(.system(size: 10)).foregroundStyle(.white.opacity(0.30))
-                Button("导入照片…", action: model.choosePhoto)
-                    .buttonStyle(.bordered).controlSize(.small)
-                    .padding(.top, 2)
-            }
-        }
-        .padding(20)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private func splitImage(before: CGImage, available: CGSize) -> some View {
-        let ratio = CGFloat(before.width) / CGFloat(before.height)
-        let width = min(max(1, available.width - 24), max(1, available.height - 20) * ratio)
-        let height = width / ratio
-        let position = CGFloat(model.splitPosition)
-        return ZStack(alignment: .leading) {
-            Image(decorative: before, scale: 1).resizable().frame(width: width, height: height)
-            if let after = model.after {
-                Image(decorative: after, scale: 1).resizable().frame(width: width, height: height)
-                    .mask(alignment: .trailing) { Rectangle().frame(width: width * (1 - position)) }
-                Rectangle().fill(Color.white.opacity(0.95)).frame(width: 1.5, height: height)
-                    .offset(x: width * position - 0.75)
-                Image(systemName: "arrow.left.and.right")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .frame(width: 29, height: 29)
-                    .background(.black.opacity(0.80), in: Circle())
-                    .overlay(Circle().strokeBorder(.white.opacity(0.70), lineWidth: 1))
-                    .offset(x: width * position - 14.5)
-            }
-        }
-        .frame(width: width, height: height)
-        .clipped()
-        .contentShape(Rectangle())
-        .gesture(DragGesture(minimumDistance: 0).onChanged { value in
-            guard model.after != nil else { return }
-            model.splitPosition = min(1, max(0, value.location.x / width))
-        })
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("照片滑动对比，左侧套用前，右侧套用后")
-    }
-
-    private var splitControl: some View {
-        HStack(spacing: 12) {
-            Text("套用前")
-            Slider(value: $model.splitPosition, in: 0...1)
-                .accessibilityLabel("照片对比分割位置")
-                .accessibilityValue("套用前占 \(Int(model.splitPosition * 100))%")
-                .help("拖动画面分割线，或用此滑块调整对比位置。")
-            Text("套用后")
-        }
-        .font(.system(size: 10)).foregroundStyle(PreviewStudioColors.muted)
-        .padding(.horizontal, 18).padding(.vertical, 8)
-        .background(PreviewStudioColors.panel)
-    }
-
-    private var filmstrip: some View {
-        HStack(spacing: 13) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 5).fill(PreviewStudioColors.canvas)
-                if let before = model.before {
-                    Image(decorative: before, scale: 1).resizable().scaledToFit().padding(4)
-                } else {
-                    Image(systemName: "photo").foregroundStyle(.white.opacity(0.2))
-                }
-            }
-            .frame(width: 78, height: 57)
-            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(model.before == nil ? PreviewStudioColors.line : Color.accentColor.opacity(0.7), lineWidth: 1))
-            VStack(alignment: .leading, spacing: 5) {
-                Text(model.photoURL?.lastPathComponent ?? "尚未导入照片")
-                    .font(.system(size: 11, weight: .medium)).lineLimit(1).truncationMode(.middle)
-                    .help(model.photoURL?.path ?? "")
-                HStack(spacing: 5) {
-                    Image(systemName: model.isPF3Preview ? "slider.horizontal.3" : "cube.transparent")
-                    Text(model.lookURL?.lastPathComponent ?? "尚未选择 CUBE / PF3")
-                        .lineLimit(1).truncationMode(.middle)
-                }
-                .font(.system(size: 10)).foregroundStyle(PreviewStudioColors.muted)
-                .help(model.lookURL?.path ?? "")
-            }
-            Spacer(minLength: 10)
-            VStack(alignment: .trailing, spacing: 5) {
-                if let before = model.before {
-                    Text("\(before.width) × \(before.height)")
-                        .font(.system(size: 10, design: .monospaced))
-                }
-                Text("sRGB 预览")
-                    .font(.system(size: 10)).foregroundStyle(PreviewStudioColors.muted)
-            }
-        }
-        .padding(.horizontal, 16).padding(.vertical, 12)
-        .background(PreviewStudioColors.panel)
-    }
-
-    private var statusBar: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) {
-                Circle().fill(model.error != nil ? Color.red : model.after != nil ? Color.green : Color.white.opacity(0.30))
-                    .frame(width: 5, height: 5)
-                Text(model.status).font(.system(size: 10)).lineLimit(1).truncationMode(.middle)
-                    .help(model.status)
-                Spacer(minLength: 0)
-            }
-            HStack(alignment: .top, spacing: 5) {
-                Image(systemName: "info.circle")
-                Text(model.previewExplanation)
-                    .fixedSize(horizontal: false, vertical: true)
-            }.font(.system(size: 10)).foregroundStyle(.white.opacity(0.32))
-        }
-        .foregroundStyle(PreviewStudioColors.muted)
-        .padding(.horizontal, 16).padding(.vertical, 9)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(PreviewStudioColors.panel)
     }
 }

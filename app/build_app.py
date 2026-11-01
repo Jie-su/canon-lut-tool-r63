@@ -128,7 +128,7 @@ def build_app(output: Path) -> None:
         "CFBundleDevelopmentRegion": "zh_CN", "CFBundleName": "Canon LUT 工具",
         "CFBundleDisplayName": "Canon LUT 工具", "CFBundleIdentifier": APP_ID,
         "CFBundleExecutable": "CanonLUTTool", "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "1.3.0", "CFBundleVersion": "6",
+        "CFBundleShortVersionString": "1.3.7", "CFBundleVersion": "13",
         "CFBundleIconFile": "AppIcon.icns",
         "LSMinimumSystemVersion": "13.0", "NSHighResolutionCapable": True,
         "NSCameraUsageDescription": "备份并写入您选择的佳能相机用户照片风格。",
@@ -140,7 +140,7 @@ def build_app(output: Path) -> None:
         "-O", "-framework", "SwiftUI", "-framework", "AppKit", "-framework", "CryptoKit",
         "-framework", "IOKit", "-framework", "CoreImage", "-framework", "ImageIO",
         ROOT / "app/CanonLUTTool.swift", ROOT / "app/CameraConnectionMonitor.swift",
-        ROOT / "app/PhotoPreview.swift", "-o", macos / "CanonLUTTool")
+        ROOT / "app/PhotoPreview.swift", ROOT / "app/PhotoPreviewPanel.swift", ROOT / "app/PreviewPhotoView.swift", ROOT / "app/ComparisonLayout.swift", "-o", macos / "CanonLUTTool")
     run("/usr/bin/clang", "-fobjc-arc", "-O2", "-arch", "arm64", "-mmacosx-version-min=13.0",
         "-ffile-prefix-map=" + str(ROOT) + "=.",
         "-framework", "Foundation", "-framework", "AppKit", "-framework", "ImageIO",
